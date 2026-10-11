@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# bllm - a minimal `llm`-style CLI for Amazon Bedrock (Converse API)
+#
+# Requires: aws cli v2 (with bedrock-runtime), jq
+#
+# Usage:
+#   bllm "Ten names for a pet pelican"
+#   cat file.py | bllm "Explain this code"
+#   bllm -m us.anthropic.claude-haiku-4-5-20251001-v1:0 -s "Be terse" "Hello"
+#   bllm -c "And a follow-up question"        # continue last conversation
+#   bllm models [-q claude]                    # list inference profile IDs for -m
+#   bllm aliases set haiku <model-id>          # manage aliases
+#
+# Environment:
+#   BLLM_MODEL    default model id / inference profile (or alias)
+#   BLLM_DIR      state dir (default: ~/.config/bllm)
+#   AWS_REGION / AWS_PROFILE   as usual for the aws cli
+
+set -euo pipefail
+
+DEFAULT_MODEL="us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+STATE_DIR="${BLLM_DIR:-$HOME/.config/bllm}"
+ALIASES_FILE="$STATE_DIR/aliases.json"
+LAST_FILE="$STATE_DIR/last.json"
+LOG_FILE="$STATE_DIR/logs.jsonl"
+mkdir -p "$STATE_DIR"
+[[ -f "$ALIASES_FILE" ]] || echo '{}' > "$ALIASES_FILE"
+
+die() { echo "bllm: $*" >&2; exit 1; }
+
+for cmd in aws jq; do
+  command -v "$cmd" >/dev/null || die "'$cmd' is required but not installed"
+done
+
+usage() {
+  cat <<'EOF'
+Usage: bllm [OPTIONS] [PROMPT]
+       bllm models [-q QUERY]
+       bllm aliases [list|set NAME MODEL|remove NAME]
+       bllm logs [-n COUNT]
+
+Options:
+  -m, --model MODEL        Model ID, inference profile, or alias
+  -s, --system TEXT        System prompt
+  -c, --continue           Continue the previous conversation
+      --cid FILE           Use/save conversation in a specific file
+  -t, --temperature N      Sampling temperature
+  -n, --max-tokens N       Max output tokens (default 4096)
+      --top-p N            Top-p
+  -u, --usage              Print token usage to stderr
+      --no-log             Don't append to the log
+      --json               Print the raw Converse response JSON
+      --region REGION      AWS region
+      --profile PROFILE    AWS profile
+  -h, --help               Show this help
+
+Stdin is prepended to PROMPT (like llm). If only stdin is given, it is the prompt.
+EOF
+}
+
+resolve_alias() {
+  local m="$1" r
+  r=$(jq -r --arg k "$m" '.[$k] // empty' "$ALIASES_FILE")
+  echo "${r:-$m}"
+}
+
+# ---------- subcommands ----------
+sub="${1:-}"
+case "$sub" in
+  models)
+    shift
+    query=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -q|--query) query="$2"; shift 2 ;;
+        --region) export AWS_REGION="$2"; shift 2 ;;
+        --profile) export AWS_PROFILE="$2"; shift 2 ;;
+        *) die "unknown option for models: $1" ;;
+      esac
+    done
+    # One line per inference profile: the ID (paste into -m) then its name.
+    # Includes system-defined cross-region profiles and your application profiles.
+    {
+      aws bedrock list-inference-profiles --type-equals SYSTEM_DEFINED --output json
+      aws bedrock list-inference-profiles --type-equals APPLICATION --output json
+    } | jq -r '.inferenceProfileSummaries[]?
+               | select(.status == "ACTIVE")
+               | [(if .type == "APPLICATION" then .inferenceProfileArn else .inferenceProfileId end),
+                  .inferenceProfileName] | @tsv' \
+      | sort -u \
+      | { if [[ -n "$query" ]]; then grep -i -- "$query" || true; else cat; fi; } \
+      | awk -F'\t' '{ printf "%-60s  %s\n", $1, $2 }'
+    exit 0
+    ;;
+  aliases)
+    shift
+    case "${1:-list}" in
+      list) jq -r 'to_entries[] | "\(.key) : \(.value)"' "$ALIASES_FILE" ;;
+      set)
+        [[ $# -ge 3 ]] || die "usage: bllm aliases set NAME MODEL"
+        tmp=$(mktemp); jq --arg k "$2" --arg v "$3" '.[$k]=$v' "$ALIASES_FILE" > "$tmp" && mv "$tmp" "$ALIASES_FILE" ;;
+      remove)
+        [[ $# -ge 2 ]] || die "usage: bllm aliases remove NAME"
+        tmp=$(mktemp); jq --arg k "$2" 'del(.[$k])' "$ALIASES_FILE" > "$tmp" && mv "$tmp" "$ALIASES_FILE" ;;
+      *) die "usage: bllm aliases [list|set NAME MODEL|remove NAME]" ;;
+    esac
+    exit 0
+    ;;
+  logs)
+    shift
+    count=3
+    [[ "${1:-}" == "-n" ]] && count="${2:-3}"
+    [[ -f "$LOG_FILE" ]] || { echo "No logs yet." >&2; exit 0; }
+    tail -n "$count" "$LOG_FILE" | jq -r '"\(.ts)  [\(.model)]\n> \(.prompt)\n\(.response)\n"'
+    exit 0
+    ;;
+esac
+
+# ---------- main prompt mode ----------
+model="${BLLM_MODEL:-$DEFAULT_MODEL}"
+system=""
+cont=0
+conv_file="$LAST_FILE"
+temperature=""
+max_tokens=4096
+top_p=""
+show_usage=0
+do_log=1
+raw=0
+prompt_args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model) model="$2"; shift 2 ;;
+    -s|--system) system="$2"; shift 2 ;;
+    -c|--continue) cont=1; shift ;;
+    --cid) conv_file="$2"; cont=1; shift 2 ;;
+    -t|--temperature) temperature="$2"; shift 2 ;;
+    -n|--max-tokens) max_tokens="$2"; shift 2 ;;
+    --top-p) top_p="$2"; shift 2 ;;
+    -u|--usage) show_usage=1; shift ;;
+    --no-log) do_log=0; shift ;;
+    --json) raw=1; shift ;;
+    --region) export AWS_REGION="$2"; shift 2 ;;
+    --profile) export AWS_PROFILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; prompt_args+=("$@"); break ;;
+    -*) die "unknown option: $1 (try --help)" ;;
+    *) prompt_args+=("$1"); shift ;;
+  esac
+done
+
+model=$(resolve_alias "$model")
+
+# Build prompt: stdin (if piped) first, then args.
+prompt=""
+if [[ ! -t 0 ]]; then
+  stdin_data=$(cat)
+  prompt="$stdin_data"
+fi
+if [[ ${#prompt_args[@]} -gt 0 ]]; then
+  args_text="${prompt_args[*]}"
+  if [[ -n "$prompt" ]]; then prompt="$prompt"$'\n'"$args_text"; else prompt="$args_text"; fi
+fi
+[[ -n "$prompt" ]] || { usage >&2; exit 1; }
+
+# Load previous messages if continuing
+if [[ $cont -eq 1 && -f "$conv_file" ]]; then
+  history=$(cat "$conv_file")
+else
+  history='[]'
+fi
+
+messages=$(jq -c --arg p "$prompt" \
+  '. + [{role:"user", content:[{text:$p}]}]' <<<"$history")
+
+# Inference config
+inference=$(jq -n -c \
+  --argjson mt "$max_tokens" \
+  --arg t "$temperature" \
+  --arg tp "$top_p" \
+  '{maxTokens:$mt}
+   + (if $t  != "" then {temperature:($t|tonumber)} else {} end)
+   + (if $tp != "" then {topP:($tp|tonumber)} else {} end)')
+
+# Request body
+req=$(mktemp); trap 'rm -f "$req"' EXIT
+jq -n -c \
+  --arg model "$model" \
+  --argjson messages "$messages" \
+  --argjson inf "$inference" \
+  --arg sys "$system" \
+  '{modelId:$model, messages:$messages, inferenceConfig:$inf}
+   + (if $sys != "" then {system:[{text:$sys}]} else {} end)' > "$req"
+
+resp=$(aws bedrock-runtime converse --cli-input-json "file://$req" --output json) \
+  || die "aws bedrock-runtime converse failed"
+
+if [[ $raw -eq 1 ]]; then
+  echo "$resp"
+else
+  jq -r '[.output.message.content[]? | .text? // empty] | join("")' <<<"$resp"
+fi
+
+text=$(jq -r '[.output.message.content[]? | .text? // empty] | join("")' <<<"$resp")
+
+# Save conversation for -c
+jq -c --arg r "$text" '. + [{role:"assistant", content:[{text:$r}]}]' <<<"$messages" > "$conv_file"
+
+if [[ $show_usage -eq 1 ]]; then
+  jq -r '"Token usage: \(.usage.inputTokens) input, \(.usage.outputTokens) output"' <<<"$resp" >&2
+fi
+
+if [[ $do_log -eq 1 ]]; then
+  jq -n -c --arg ts "$(date -u +%FT%TZ)" --arg m "$model" --arg p "$prompt" \
+    --arg s "$system" --arg r "$text" \
+    '{ts:$ts, model:$m, system:$s, prompt:$p, response:$r}' >> "$LOG_FILE"
+fi
